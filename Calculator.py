@@ -1,17 +1,46 @@
 import json
 import math
+import os
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg.types.json import Json
+except ImportError:
+    psycopg = None
+    dict_row = None
+    Json = None
+
 PROFILE_FILE = Path("profiles.json")
+SCHEMA_SQL_FILE = Path("sql/user_profiles.sql")
 MAX_FDS = 3
 MAX_EXPENSES = 5
 CRORE = 1e7
+
+LOCAL_MODE = "local"
+CLOUD_MODE = "cloud"
+MISCONFIGURED_MODE = "misconfigured"
+
+
+@dataclass(frozen=True)
+class UserIdentity:
+    issuer: str
+    subject: str
+    email: str
+    display_name: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.issuer}|{self.subject}"
 
 
 def future_value(p: float, r: float, t: float) -> float:
@@ -32,21 +61,28 @@ def stepup_sip(monthly: float, rate: float, years: int, stepup: float):
     return value, values
 
 
-def _is_defined_number(value):
+def is_defined_number(value: Any):
     return not (isinstance(value, float) and math.isnan(value))
 
 
-def load_profiles() -> dict:
+def load_local_profiles() -> dict:
     if PROFILE_FILE.exists():
         try:
-            return json.loads(PROFILE_FILE.read_text())
+            return json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
     return {}
 
 
-def save_profiles(profiles: dict):
-    PROFILE_FILE.write_text(json.dumps(profiles, indent=2))
+def save_local_profiles(profiles: dict):
+    PROFILE_FILE.write_text(json.dumps(profiles, indent=2), encoding="utf-8")
+
+
+def get_secret(name: str, default: str | None = None) -> str | None:
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, default)
 
 
 def to_crores(value: float) -> float:
@@ -125,15 +161,44 @@ def normalize_profile(profile: dict | None) -> dict:
 
 
 def initialize_session_state():
+    state_defaults = {
+        "profile_selection": "New profile",
+        "profile_save_name": "",
+        "profile_loaded_from": "",
+        "pending_profile": None,
+        "pending_profile_reset": False,
+        "pending_full_reset": False,
+        "flash_message": None,
+        "active_principal": None,
+        "guest_mode_selected": False,
+    }
     for key, default in DEFAULT_STATE.items():
         if key not in st.session_state or st.session_state[key] is None:
             st.session_state[key] = default
+    for key, default in state_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+
+def reset_form_state():
+    for key, default in DEFAULT_STATE.items():
+        st.session_state[key] = default
+    st.session_state["profile_selection"] = "New profile"
+    st.session_state["profile_save_name"] = ""
+    st.session_state["profile_loaded_from"] = ""
+    st.session_state["pending_profile"] = None
+
+
+def apply_pending_full_reset():
+    if st.session_state.pop("pending_full_reset", False):
+        reset_form_state()
 
 
 def apply_pending_profile_reset():
     if st.session_state.pop("pending_profile_reset", False):
         st.session_state["profile_selection"] = "New profile"
         st.session_state["profile_save_name"] = ""
+        st.session_state["profile_loaded_from"] = ""
 
 
 def apply_pending_profile():
@@ -152,58 +217,507 @@ def assemble_payload() -> dict:
     }
 
 
-def load_profile_to_state(profile_name: str, profiles: dict):
-    profile = profiles.get(profile_name)
+def auth_is_available() -> bool:
+    return hasattr(st.user, "is_logged_in")
+
+
+def is_logged_in() -> bool:
+    return auth_is_available() and bool(getattr(st.user, "is_logged_in", False))
+
+
+def get_current_user() -> UserIdentity | None:
+    if not is_logged_in():
+        return None
+
+    user_data = st.user.to_dict() if hasattr(st.user, "to_dict") else dict(st.user)
+    issuer = str(user_data.get("iss") or "")
+    subject = str(user_data.get("sub") or user_data.get("email") or "")
+    email = str(
+        user_data.get("email")
+        or user_data.get("preferred_username")
+        or user_data.get("upn")
+        or ""
+    )
+    display_name = str(
+        user_data.get("name")
+        or user_data.get("given_name")
+        or email
+        or "Signed-in user"
+    )
+    if not issuer or not subject:
+        return None
+    return UserIdentity(
+        issuer=issuer,
+        subject=subject,
+        email=email,
+        display_name=display_name,
+    )
+
+
+def get_app_mode() -> str:
+    db_configured = bool(get_secret("SUPABASE_DB_URL"))
+    auth_configured = auth_is_available()
+    if db_configured and auth_configured:
+        return CLOUD_MODE
+    if not db_configured and not auth_configured:
+        return LOCAL_MODE
+    return MISCONFIGURED_MODE
+
+
+def get_active_principal(mode: str, user_identity: UserIdentity | None) -> str:
+    if mode == LOCAL_MODE:
+        return LOCAL_MODE
+    if user_identity:
+        return user_identity.key
+    return "guest"
+
+
+def sync_principal_state(mode: str, user_identity: UserIdentity | None):
+    principal = get_active_principal(mode, user_identity)
+    previous_principal = st.session_state.get("active_principal")
+    if previous_principal is None:
+        st.session_state["active_principal"] = principal
+        return
+    if previous_principal != principal:
+        st.session_state["active_principal"] = principal
+        st.session_state["pending_full_reset"] = True
+        if principal != LOCAL_MODE:
+            st.session_state["guest_mode_selected"] = principal == "guest"
+
+
+def flash(level: str, message: str):
+    st.session_state["flash_message"] = {"level": level, "message": message}
+
+
+def render_flash_message():
+    payload = st.session_state.pop("flash_message", None)
+    if not payload:
+        return
+    level = payload["level"]
+    message = payload["message"]
+    if level == "success":
+        st.success(message)
+    elif level == "warning":
+        st.warning(message)
+    elif level == "error":
+        st.error(message)
+    else:
+        st.info(message)
+
+
+def get_auth_provider_name() -> str | None:
+    try:
+        auth_config = st.secrets["auth"]
+    except Exception:
+        return None
+    try:
+        if "google" in auth_config:
+            return "google"
+    except Exception:
+        return None
+    return None
+
+
+def login_with_google():
+    provider_name = get_auth_provider_name()
+    if provider_name:
+        st.login(provider_name)
+    else:
+        st.login()
+
+
+def continue_as_guest():
+    st.session_state["guest_mode_selected"] = True
+    flash("info", "Guest mode active. Sign in to save and manage cloud profiles.")
+    st.rerun()
+
+
+def logout_current_user():
+    st.session_state["pending_full_reset"] = True
+    st.session_state["guest_mode_selected"] = True
+    st.logout()
+
+
+def load_schema_sql() -> str:
+    if SCHEMA_SQL_FILE.exists():
+        return SCHEMA_SQL_FILE.read_text(encoding="utf-8")
+    return """
+    create schema if not exists private;
+
+    create table if not exists private.user_profiles (
+        id bigint generated by default as identity primary key,
+        issuer text not null,
+        subject text not null,
+        email text,
+        profile_name text not null,
+        payload jsonb not null,
+        created_at timestamptz not null default timezone('utc', now()),
+        updated_at timestamptz not null default timezone('utc', now()),
+        unique (issuer, subject, profile_name)
+    );
+
+    create index if not exists idx_user_profiles_user
+        on private.user_profiles (issuer, subject);
+    """
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_database_schema(db_url: str):
+    if psycopg is None or Json is None or dict_row is None:
+        raise RuntimeError(
+            "Database support requires psycopg. Install requirements.txt before using cloud profiles."
+        )
+
+    try:
+        with psycopg.connect(db_url, autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(load_schema_sql())
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not initialize the Supabase profile table. "
+            "Check SUPABASE_DB_URL and run the setup SQL if your DB user cannot create schemas."
+        ) from exc
+
+
+def run_db_query(query: str, params: tuple = (), fetch: str | None = None):
+    db_url = get_secret("SUPABASE_DB_URL")
+    if not db_url:
+        raise RuntimeError("SUPABASE_DB_URL is missing.")
+
+    ensure_database_schema(db_url)
+
+    try:
+        with psycopg.connect(db_url, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                if fetch == "one":
+                    result = cursor.fetchone()
+                elif fetch == "all":
+                    result = cursor.fetchall()
+                else:
+                    result = None
+            connection.commit()
+        return result
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "Supabase profile storage is unavailable right now. Verify your database URL and permissions."
+        ) from exc
+
+
+def list_profiles(user_identity: UserIdentity | None) -> list[str]:
+    mode = get_app_mode()
+    if mode == LOCAL_MODE:
+        return sorted(load_local_profiles().keys())
+    if mode == CLOUD_MODE and user_identity:
+        rows = run_db_query(
+            """
+            select profile_name
+            from private.user_profiles
+            where issuer = %s and subject = %s
+            order by profile_name
+            """,
+            (user_identity.issuer, user_identity.subject),
+            fetch="all",
+        )
+        return [row["profile_name"] for row in rows or []]
+    return []
+
+
+def load_profile(user_identity: UserIdentity | None, profile_name: str) -> dict | None:
+    mode = get_app_mode()
+    if mode == LOCAL_MODE:
+        return normalize_profile(load_local_profiles().get(profile_name))
+    if mode == CLOUD_MODE and user_identity:
+        row = run_db_query(
+            """
+            select payload
+            from private.user_profiles
+            where issuer = %s and subject = %s and profile_name = %s
+            """,
+            (user_identity.issuer, user_identity.subject, profile_name),
+            fetch="one",
+        )
+        if not row:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return normalize_profile(payload)
+    return None
+
+
+def save_profile(user_identity: UserIdentity | None, profile_name: str, payload: dict):
+    normalized_payload = normalize_profile(payload)
+    mode = get_app_mode()
+    if mode == LOCAL_MODE:
+        profiles = load_local_profiles()
+        profiles[profile_name] = normalized_payload
+        save_local_profiles(profiles)
+        return
+    if mode == CLOUD_MODE:
+        if user_identity is None:
+            raise PermissionError("Sign in with Google to save profiles online.")
+        run_db_query(
+            """
+            insert into private.user_profiles (
+                issuer, subject, email, profile_name, payload, created_at, updated_at
+            )
+            values (
+                %s, %s, %s, %s, %s, timezone('utc', now()), timezone('utc', now())
+            )
+            on conflict (issuer, subject, profile_name)
+            do update set
+                email = excluded.email,
+                payload = excluded.payload,
+                updated_at = timezone('utc', now())
+            """,
+            (
+                user_identity.issuer,
+                user_identity.subject,
+                user_identity.email,
+                profile_name,
+                Json(normalized_payload),
+            ),
+        )
+        return
+    raise RuntimeError(
+        "Cloud profile storage is not fully configured. Add both authentication secrets and SUPABASE_DB_URL."
+    )
+
+
+def delete_profile(user_identity: UserIdentity | None, profile_name: str):
+    mode = get_app_mode()
+    if mode == LOCAL_MODE:
+        profiles = load_local_profiles()
+        if profile_name not in profiles:
+            raise KeyError(profile_name)
+        del profiles[profile_name]
+        save_local_profiles(profiles)
+        return
+    if mode == CLOUD_MODE:
+        if user_identity is None:
+            raise PermissionError("Sign in with Google to delete profiles.")
+        deleted = run_db_query(
+            """
+            delete from private.user_profiles
+            where issuer = %s and subject = %s and profile_name = %s
+            returning id
+            """,
+            (user_identity.issuer, user_identity.subject, profile_name),
+            fetch="one",
+        )
+        if not deleted:
+            raise KeyError(profile_name)
+        return
+    raise RuntimeError(
+        "Cloud profile storage is not fully configured. Add both authentication secrets and SUPABASE_DB_URL."
+    )
+
+
+def import_seed_profiles(user_identity: UserIdentity | None) -> int:
+    if user_identity is None:
+        raise PermissionError("Sign in with Google to import profiles.")
+
+    seed_profiles = load_local_profiles()
+    if not seed_profiles:
+        return 0
+
+    count = 0
+    for name, profile in seed_profiles.items():
+        save_profile(user_identity, name, profile)
+        count += 1
+    return count
+
+
+def load_profile_to_state(profile_name: str, user_identity: UserIdentity | None):
+    profile = load_profile(user_identity, profile_name)
     if not profile:
+        st.warning(f"Profile '{profile_name}' was not found.")
         return
     st.session_state["pending_profile"] = profile
     st.session_state["profile_loaded_from"] = profile_name
     st.session_state["profile_save_name"] = profile_name
+    flash("success", f"Profile '{profile_name}' loaded.")
     st.rerun()
 
 
-def save_current_profile():
-    name = (st.session_state.get("profile_save_name") or selected_profile).strip()
+def save_current_profile(user_identity: UserIdentity | None):
+    name = (
+        st.session_state.get("profile_save_name")
+        or st.session_state.get("profile_loaded_from")
+        or ""
+    ).strip()
     if not name:
-        st.error("Provide a name to save the profile.")
+        st.error("Provide a profile name before saving.")
         return
-    snapshots = load_profiles()
-    snapshots[name] = assemble_payload()
-    save_profiles(snapshots)
+    try:
+        save_profile(user_identity, name, assemble_payload())
+    except PermissionError as exc:
+        st.error(str(exc))
+        return
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    st.session_state["profile_loaded_from"] = name
     st.success(f"Profile '{name}' saved.")
 
 
-def delete_profile(profile_name: str):
-    snapshots = load_profiles()
-    if profile_name not in snapshots:
-        st.warning(f"Profile '{profile_name}' was not found.")
-        return
-    del snapshots[profile_name]
-    save_profiles(snapshots)
-    st.session_state["pending_profile_reset"] = True
-    st.success(f"Profile '{profile_name}' deleted.")
+def delete_selected_profile(profile_name: str, user_identity: UserIdentity | None):
+    try:
+        delete_profile(user_identity, profile_name)
+    except KeyError:
+        flash("warning", f"Profile '{profile_name}' was not found.")
+    except PermissionError as exc:
+        flash("error", str(exc))
+    except RuntimeError as exc:
+        flash("error", str(exc))
+    else:
+        st.session_state["pending_profile_reset"] = True
+        flash("success", f"Profile '{profile_name}' deleted.")
     st.rerun()
 
 
 @st.dialog("Delete profile?")
-def confirm_delete_profile_dialog(profile_name: str):
+def confirm_delete_profile_dialog(profile_name: str, user_identity: UserIdentity | None):
     st.write(f"Delete profile '{profile_name}'? This action cannot be undone.")
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
         if st.button("Delete", type="primary", key="confirm_delete_profile_button"):
-            delete_profile(profile_name)
+            delete_selected_profile(profile_name, user_identity)
     with cancel_col:
         if st.button("Cancel", key="cancel_delete_profile_button"):
             st.rerun()
 
 
+def render_auth_section(mode: str, user_identity: UserIdentity | None):
+    with st.container(border=True):
+        st.subheader("Access")
+
+        if mode == LOCAL_MODE:
+            st.info(
+                "Local single-user mode is active. Profiles save to profiles.json on this machine."
+            )
+            return
+
+        if mode == MISCONFIGURED_MODE:
+            st.error(
+                "Cloud mode is partially configured. Add both Streamlit OIDC auth secrets and "
+                "SUPABASE_DB_URL to enable per-user profile storage."
+            )
+            if auth_is_available() and not user_identity:
+                action_col1, action_col2 = st.columns([1, 1])
+                with action_col1:
+                    if st.button("Continue as guest", key="continue_as_guest_button"):
+                        continue_as_guest()
+                with action_col2:
+                    if st.button("Log in with Google", key="login_google_button"):
+                        login_with_google()
+            elif user_identity:
+                info_col1, info_col2 = st.columns([4, 1])
+                with info_col1:
+                    st.write(
+                        f"Signed in as **{user_identity.display_name}** "
+                        f"({user_identity.email or 'email unavailable'})"
+                    )
+                with info_col2:
+                    if st.button("Log out", key="logout_button"):
+                        logout_current_user()
+            return
+
+        if user_identity:
+            action_cols = st.columns([4, 1, 1])
+            with action_cols[0]:
+                st.success(
+                    f"Signed in as {user_identity.display_name} "
+                    f"({user_identity.email or 'email unavailable'})"
+                )
+            with action_cols[1]:
+                import_disabled = len(load_local_profiles()) == 0
+                if st.button(
+                    "Import local profiles",
+                    key="import_local_profiles_button",
+                    disabled=import_disabled,
+                ):
+                    try:
+                        imported_count = import_seed_profiles(user_identity)
+                    except (PermissionError, RuntimeError) as exc:
+                        flash("error", str(exc))
+                    else:
+                        flash(
+                            "success",
+                            f"Imported or updated {imported_count} profile(s) from profiles.json.",
+                        )
+                    st.rerun()
+            with action_cols[2]:
+                if st.button("Log out", key="logout_button"):
+                    logout_current_user()
+            return
+
+        info_text = (
+            "Guest mode is active. You can use the calculator, but saving, loading, and deleting "
+            "profiles requires sign-in."
+            if st.session_state.get("guest_mode_selected")
+            else "Choose how to continue. Guest mode works immediately, and Google sign-in "
+            "unlocks your private cloud profiles."
+        )
+        action_cols = st.columns([4, 1, 1])
+        with action_cols[0]:
+            st.info(info_text)
+        with action_cols[1]:
+            if st.button("Continue as guest", key="continue_as_guest_button"):
+                continue_as_guest()
+        with action_cols[2]:
+            if st.button("Log in with Google", key="login_google_button"):
+                login_with_google()
+
+
+def get_profile_section_state(mode: str, user_identity: UserIdentity | None):
+    if mode == LOCAL_MODE:
+        return {"names": list_profiles(user_identity), "disabled": False, "error": None}
+    if mode == CLOUD_MODE and user_identity:
+        try:
+            return {"names": list_profiles(user_identity), "disabled": False, "error": None}
+        except RuntimeError as exc:
+            return {"names": [], "disabled": True, "error": str(exc)}
+    if mode == CLOUD_MODE:
+        return {"names": [], "disabled": True, "error": None}
+    return {"names": [], "disabled": True, "error": None}
+
+
 st.set_page_config(layout="wide")
-st.title("📊 Personal Wealth Dashboard")
+st.title("Personal Wealth Dashboard")
 
 initialize_session_state()
+current_user = get_current_user()
+app_mode = get_app_mode()
+sync_principal_state(app_mode, current_user)
+apply_pending_full_reset()
 apply_pending_profile_reset()
 apply_pending_profile()
-profiles = load_profiles()
+
+render_flash_message()
+render_auth_section(app_mode, current_user)
+
+profile_state = get_profile_section_state(app_mode, current_user)
+profile_names = ["New profile"] + profile_state["names"]
+if st.session_state.get("profile_selection") not in profile_names:
+    st.session_state["profile_selection"] = "New profile"
+
+if app_mode == LOCAL_MODE:
+    st.caption("Profiles are stored locally in profiles.json.")
+elif app_mode == CLOUD_MODE and current_user:
+    st.caption("Your saved profiles are stored in Supabase and scoped to your account.")
+elif app_mode == CLOUD_MODE:
+    st.caption("Guest mode does not persist profiles. Sign in to access cloud storage.")
+else:
+    st.caption(
+        "Profile storage is unavailable until authentication and database secrets are configured."
+    )
+
+if profile_state["error"]:
+    st.error(profile_state["error"])
 
 summary_col1, summary_col2, summary_col3 = st.columns(3)
 with summary_col1:
@@ -225,40 +739,45 @@ with summary_col3:
         f"**Ends in:** {int(start_year) + int(projection_years) - 1}"
     )
 
-profile_names = ["New profile"] + sorted(profiles.keys())
-if st.session_state.get("profile_selection") not in profile_names:
-    st.session_state["profile_selection"] = "New profile"
+profile_controls_disabled = profile_state["disabled"]
 profile_col1, profile_col2, profile_col3 = st.columns([2, 1, 1])
 with profile_col1:
     selected_profile = st.selectbox(
         "Load saved profile",
         profile_names,
         key="profile_selection",
+        disabled=profile_controls_disabled,
     )
-    if st.button("Load profile", key="load_profile_button"):
+    if st.button(
+        "Load profile",
+        key="load_profile_button",
+        disabled=profile_controls_disabled,
+    ):
         if selected_profile != "New profile":
-            load_profile_to_state(selected_profile, profiles)
+            load_profile_to_state(selected_profile, current_user)
         else:
             st.warning("Pick a stored profile to load.")
 with profile_col2:
     st.text_input(
         "Profile name to save",
         key="profile_save_name",
+        disabled=profile_controls_disabled,
     )
-    st.button(
+    if st.button(
         "Save profile",
-        on_click=save_current_profile,
         key="save_profile_button",
-    )
+        disabled=profile_controls_disabled,
+    ):
+        save_current_profile(current_user)
 with profile_col3:
     st.write("")
     st.write("")
     if st.button(
         "Delete profile",
         key="delete_profile_button",
-        disabled=selected_profile == "New profile",
+        disabled=profile_controls_disabled or selected_profile == "New profile",
     ):
-        confirm_delete_profile_dialog(selected_profile)
+        confirm_delete_profile_dialog(selected_profile, current_user)
 
 # ---------- TABS ----------
 tab1, tab2, tab3, tab4 = st.tabs(
@@ -368,7 +887,7 @@ with tab1:
                 key="sip_step",
             )
             if not all(
-                _is_defined_number(value)
+                is_defined_number(value)
                 for value in (sip_monthly, sip_rate, sip_step)
             ):
                 st.warning("Complete all SIP inputs to compute future value.")

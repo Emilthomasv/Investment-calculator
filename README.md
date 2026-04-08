@@ -1,18 +1,15 @@
 # Investment Calculator
 
-A Streamlit-based personal wealth dashboard for projecting investments, planned expenses, safety funds, and net future wealth over time.
+A Streamlit-based wealth dashboard for projecting investments, planned expenses, safety funds, and net future wealth over time.
 
 ## Features
 
-- Project future value for:
-  - Fixed Deposits
-  - Stocks
-  - Mutual Funds
-  - Step-up SIPs
+- Project future value for fixed deposits, stocks, mutual funds, and step-up SIPs
 - Add future one-time expenses by year
-- Include emergency fund and insurance corpus
-- View yearly wealth snapshots and charts
-- Save, load, and delete named profiles
+- Track emergency fund and insurance corpus
+- View yearly snapshots and charts
+- Support local single-user mode with `profiles.json`
+- Support hosted multi-user mode with Google sign-in, guest access, and Supabase-backed private profiles
 
 ## Tech Stack
 
@@ -20,12 +17,16 @@ A Streamlit-based personal wealth dashboard for projecting investments, planned 
 - Streamlit
 - Pandas
 - Matplotlib
+- Supabase Postgres
+- psycopg
 
 ## Project Files
 
 - `Calculator.py` - main Streamlit app
-- `profiles.json` - local profile storage
+- `profiles.json` - local profile storage and import seed
 - `requirements.txt` - Python dependencies
+- `sql/user_profiles.sql` - Supabase schema for hosted profile storage
+- `.streamlit/secrets.toml.example` - example auth and database secrets
 
 ## Run Locally
 
@@ -48,61 +49,83 @@ streamlit run Calculator.py
 http://localhost:8501
 ```
 
+If you do nothing else, the app runs in local single-user mode and stores profiles in `profiles.json`.
+
+## Modes
+
+### Local Mode
+
+- No auth secrets and no `SUPABASE_DB_URL`
+- Save, load, and delete profiles from `profiles.json`
+- Best for personal/local use
+
+### Hosted Cloud Mode
+
+- Streamlit OIDC auth configured
+- `SUPABASE_DB_URL` configured
+- Guests can use the calculator but cannot save profiles
+- Signed-in users can save, load, overwrite, and delete only their own profiles
+- Signed-in users can import local seed profiles from `profiles.json`
+
+## Streamlit Cloud Setup
+
+### 1. Google OIDC
+
+Configure your Google OAuth client so the redirect URI matches your deployed app:
+
+```text
+https://<your-app>.streamlit.app/oauth2callback
+```
+
+For local development, the example file uses:
+
+```text
+http://localhost:8501/oauth2callback
+```
+
+### 2. Supabase Database
+
+Run the schema in:
+
+```text
+sql/user_profiles.sql
+```
+
+This creates the `private.user_profiles` table used by the app.
+
+### 3. Streamlit Secrets
+
+Add secrets in Streamlit Community Cloud using `.streamlit/secrets.toml.example` as your template.
+
+Required values:
+
+- Streamlit `[auth]` settings
+- Google provider credentials under `[auth.google]`
+- `SUPABASE_DB_URL`
+
 ## How Profiles Work
 
-- Enter values in the dashboard.
-- Type a profile name in `Profile name to save`.
-- Click `Save profile` to store the current inputs.
-- Select a saved profile from `Load saved profile` and click `Load profile`.
-- Click `Delete profile` to remove a saved profile after confirmation.
+### Local mode
 
-Profiles are stored in `profiles.json` when running locally.
+- Profiles save to `profiles.json`
+
+### Cloud mode
+
+- Guests cannot save or load profiles
+- Signed-in users only see profiles stored for their own login identity
+- Saving with the same profile name overwrites only that user's version
+- `Import local profiles` upserts the bundled `profiles.json` entries into the signed-in user's account
 
 ## Deployment
 
-This app can be deployed easily on Streamlit Community Cloud.
-
-### Deploy Steps
-
 1. Push this project to GitHub.
-2. Make sure `requirements.txt` is included in the repo.
-3. In Streamlit Community Cloud, create a new app from the repo.
-4. Set the main file path to:
-
-```text
-Calculator.py
-```
-
-## Important Note About Online Profile Storage
-
-`profiles.json` is fine for local use, but it is not reliable persistent storage for a hosted app.
-
-On Streamlit Cloud:
-
-- the file is stored in the app's temporary filesystem
-- it can be reset during redeploys or restarts
-- all users share the same file
-- saved profiles are not guaranteed to persist long term
-
-For production-style hosting, move profile data to a persistent backend such as:
-
-- Supabase
-- Firebase
-- Google Sheets
-- PostgreSQL
+2. Make sure `requirements.txt` is committed.
+3. Add your Streamlit secrets in Community Cloud.
+4. Deploy `Calculator.py` as the app entrypoint.
 
 ## Dependencies
-
-Current versions in `requirements.txt`:
 
 - `streamlit==1.55.0`
 - `pandas==2.3.3`
 - `matplotlib==3.10.8`
-
-## Future Improvements
-
-- Persistent cloud profile storage
-- Authentication per user
-- Export reports to CSV or PDF
-- Better mobile layout and styling
-
+- `psycopg[binary]>=3.2,<4`

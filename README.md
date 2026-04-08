@@ -91,7 +91,7 @@ Run the schema in:
 sql/user_profiles.sql
 ```
 
-This creates the `private.user_profiles` table used by the app.
+This creates the `public.user_profiles` table used by the app.
 
 ### 3. Streamlit Secrets
 

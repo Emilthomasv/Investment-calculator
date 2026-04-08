@@ -91,7 +91,9 @@ Run the schema in:
 sql/user_profiles.sql
 ```
 
-This creates the `public.user_profiles` table used by the app.
+This creates the `public.user_profiles` table used by the app. The SQL targets the
+existing `public` schema, so it works with Supabase roles that can create tables
+but cannot create schemas.
 
 ### 3. Streamlit Secrets
 

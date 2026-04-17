@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -784,11 +784,11 @@ with profile_col3:
         confirm_delete_profile_dialog(selected_profile, current_user)
 
 # ---------- TABS ----------
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🪙 Investments", "💸 Expenses", "🛡️ Safety", "📈 Summary"]
+summary_tab, investments_tab, expenses_tab, safety_tab = st.tabs(
+    ["Summary", "Investments", "Expenses", "Safety"]
 )
 
-# ---------- TAB 1: INVESTMENTS ----------
+# ---------- INVESTMENTS TAB ----------
 fd_entries = []
 stock_entry = None
 mf_entry = None
@@ -798,7 +798,7 @@ stock_total = 0.0
 mf_total = 0.0
 sip_total = 0.0
 
-with tab1:
+with investments_tab:
     st.header("Investments")
 
     use_fd = st.checkbox("Include FDs", key="use_fd")
@@ -903,11 +903,11 @@ with tab1:
                     f"SIP future: ₹{sip_total:,.0f} ({to_crores(sip_total):,.2f} Cr)"
                 )
 
-# ---------- TAB 2: EXPENSES ----------
+# ---------- EXPENSES TAB ----------
 expenses = []
 total_expenses = 0.0
 expense_schedule = defaultdict(float)
-with tab2:
+with expenses_tab:
     st.header("Future Expenses")
     exp_count = st.number_input(
         "Number of expense entries",
@@ -943,8 +943,8 @@ with tab2:
         f"Total future expenses: ₹{total_expenses:,.0f} ({to_crores(total_expenses):,.2f} Cr)"
     )
 
-# ---------- TAB 3: SAFETY ----------
-with tab3:
+# ---------- SAFETY TAB ----------
+with safety_tab:
     st.header("Safety Funds")
     emergency = st.number_input(
         "Emergency fund",
@@ -1010,53 +1010,156 @@ summary_df = pd.DataFrame(
     }
 )
 
-with tab4:
+# ---------- SUMMARY TAB ----------
+with summary_tab:
     st.header("Wealth Summary")
-    st.metric(
-        "Total assets",
-        f"₹{to_crores(total_assets):,.2f} Cr",
-        f"SIP future value included: {to_crores(sip_total):,.2f} Cr",
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    with metric_col1:
+        st.metric(
+            "Total assets",
+            f"₹{to_crores(total_assets):,.2f} Cr",
+            f"SIP future value: {to_crores(sip_total):,.2f} Cr",
+        )
+    with metric_col2:
+        st.metric(
+            "Expenses (total)",
+            f"₹{to_crores(total_expenses):,.2f} Cr",
+        )
+    with metric_col3:
+        st.metric(
+            "Safety corpus",
+            f"₹{to_crores(total_safety):,.2f} Cr",
+        )
+    with metric_col4:
+        st.metric(
+            "Net future wealth",
+            f"₹{to_crores(net_total):,.2f} Cr",
+        )
+
+    st.subheader("Interactive growth view")
+    st.caption("Hover for exact values and drag within the chart to zoom.")
+
+    growth_chart_df = summary_df.rename(
+        columns={
+            "Assets (Cr)": "Assets",
+            "Expenses (Cr)": "Cumulative expenses",
+            "Net (Cr)": "Net wealth",
+        }
+    ).melt(id_vars="Year", var_name="Series", value_name="Value")
+
+    growth_hover = alt.selection_point(
+        fields=["Year"],
+        nearest=True,
+        on="pointermove",
+        empty=False,
     )
-    st.metric(
-        "Expenses (total)",
-        f"₹{to_crores(total_expenses):,.2f} Cr",
+
+    growth_lines = alt.Chart(growth_chart_df).mark_line(
+        point=alt.OverlayMarkDef(size=80)
+    ).encode(
+        x=alt.X("Year:Q", axis=alt.Axis(format="d"), title="Year"),
+        y=alt.Y("Value:Q", title="Crores"),
+        color=alt.Color("Series:N", title="Series"),
+        tooltip=[
+            alt.Tooltip("Year:Q", format=".0f"),
+            alt.Tooltip("Series:N"),
+            alt.Tooltip("Value:Q", format=".2f", title="Crores"),
+        ],
     )
-    st.metric(
-        "Safety corpus",
-        f"₹{to_crores(total_safety):,.2f} Cr",
+
+    growth_points = alt.Chart(growth_chart_df).mark_circle(size=120).encode(
+        x=alt.X("Year:Q", axis=alt.Axis(format="d"), title="Year"),
+        y=alt.Y("Value:Q", title="Crores"),
+        color=alt.Color("Series:N", title="Series"),
+        tooltip=[
+            alt.Tooltip("Year:Q", format=".0f"),
+            alt.Tooltip("Series:N"),
+            alt.Tooltip("Value:Q", format=".2f", title="Crores"),
+        ],
+    ).transform_filter(growth_hover)
+
+    growth_rule = alt.Chart(growth_chart_df).mark_rule(color="#94a3b8").encode(
+        x=alt.X("Year:Q", axis=alt.Axis(format="d"), title="Year")
+    ).transform_filter(growth_hover)
+
+    growth_chart = (
+        (growth_lines + growth_points + growth_rule)
+        .add_params(growth_hover)
+        .properties(height=360)
+        .interactive()
     )
-    st.metric(
-        "Net future wealth",
-        f"₹{to_crores(net_total):,.2f} Cr",
-    )
+    st.altair_chart(growth_chart, use_container_width=True)
+
+    detail_col1, detail_col2 = st.columns(2)
+
+    with detail_col1:
+        annual_expense_df = pd.DataFrame(
+            {
+                "Year": year_labels,
+                "Annual expenses": [to_crores(val) for val in expense_yearly],
+            }
+        )
+        annual_expense_chart = alt.Chart(annual_expense_df).mark_bar(
+            color="#d62728",
+            cornerRadiusTopLeft=6,
+            cornerRadiusTopRight=6,
+        ).encode(
+            x=alt.X("Year:Q", axis=alt.Axis(format="d"), title="Year"),
+            y=alt.Y("Annual expenses:Q", title="Crores"),
+            tooltip=[
+                alt.Tooltip("Year:Q", format=".0f"),
+                alt.Tooltip("Annual expenses:Q", format=".2f", title="Crores"),
+            ],
+        ).properties(
+            height=300,
+            title="Annual expenses",
+        ).interactive()
+        st.altair_chart(annual_expense_chart, use_container_width=True)
+
+    with detail_col2:
+        asset_mix_df = pd.DataFrame(
+            {
+                "Category": asset_mix_labels,
+                "Value": [to_crores(val) for val in asset_mix_values],
+            }
+        )
+        if asset_mix_df.empty:
+            st.info("Add investments to unlock the asset mix chart.")
+        else:
+            asset_mix_selection = alt.selection_point(
+                fields=["Category"],
+                bind="legend",
+            )
+            asset_mix_chart = alt.Chart(asset_mix_df).mark_arc(
+                innerRadius=70,
+                outerRadius=120,
+            ).encode(
+                theta=alt.Theta("Value:Q", title="Crores"),
+                color=alt.Color("Category:N", title="Asset type"),
+                opacity=alt.condition(
+                    asset_mix_selection,
+                    alt.value(1.0),
+                    alt.value(0.35),
+                ),
+                tooltip=[
+                    alt.Tooltip("Category:N"),
+                    alt.Tooltip("Value:Q", format=".2f", title="Crores"),
+                ],
+            ).add_params(asset_mix_selection).properties(
+                height=300,
+                title="Asset mix",
+            )
+            st.altair_chart(asset_mix_chart, use_container_width=True)
 
     st.subheader("Yearly snapshot")
     st.dataframe(
-        summary_df.style.format({"Assets (Cr)": "{:.2f}", "Expenses (Cr)": "{:.2f}", "Net (Cr)": "{:.2f}"})
+        summary_df.style.format(
+            {
+                "Assets (Cr)": "{:.2f}",
+                "Expenses (Cr)": "{:.2f}",
+                "Net (Cr)": "{:.2f}",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
     )
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes[0, 0].plot(year_labels, [to_crores(val) for val in asset_curve], marker="o")
-    axes[0, 0].set_title("Assets (Cr)")
-    axes[0, 0].set_ylabel("Crores")
-
-    axes[0, 1].bar(year_labels, [to_crores(val) for val in expense_yearly], color="#d62728")
-    axes[0, 1].set_title("Annual expenses (Cr)")
-
-    axes[1, 0].plot(year_labels, [to_crores(val) for val in net_curve], marker="s", color="#2ca02c")
-    axes[1, 0].set_title("Net wealth (Cr)")
-
-    if asset_mix_values:
-        axes[1, 1].pie(
-            [to_crores(val) for val in asset_mix_values],
-            labels=asset_mix_labels,
-            autopct="%1.1f%%",
-            startangle=90,
-        )
-        axes[1, 1].set_title("Asset mix (Cr)")
-    else:
-        axes[1, 1].text(0.5, 0.5, "Add investments to view mix", ha="center", va="center")
-        axes[1, 1].axis("off")
-
-    fig.tight_layout()
-    st.pyplot(fig)

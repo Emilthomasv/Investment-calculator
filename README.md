@@ -91,9 +91,14 @@ Run the schema in:
 sql/user_profiles.sql
 ```
 
-This creates the `public.user_profiles` table used by the app. The SQL targets the
-existing `public` schema, so it works with Supabase roles that can create tables
-but cannot create schemas.
+This creates the `public.user_profiles` table used by the app, enables Row-Level
+Security, and revokes access from Supabase's browser-facing `anon` and
+`authenticated` roles. The SQL targets the existing `public` schema, so it works
+with Supabase roles that can create tables but cannot create schemas.
+
+If you already deployed an earlier version of the app, rerun this SQL once or
+restart the app with a `SUPABASE_DB_URL` user that can alter the table so the
+existing table is hardened too.
 
 ### 3. Streamlit Secrets
 
@@ -117,6 +122,7 @@ Required values:
 - Signed-in users only see profiles stored for their own login identity
 - Saving with the same profile name overwrites only that user's version
 - `Import local profiles` upserts the bundled `profiles.json` entries into the signed-in user's account
+- Direct public access to `public.user_profiles` through the Supabase project URL is blocked by RLS
 
 ## Deployment
 

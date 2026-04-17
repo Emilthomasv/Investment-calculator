@@ -12,3 +12,7 @@ create table if not exists public.user_profiles (
 
 create index if not exists idx_user_profiles_user
     on public.user_profiles (issuer, subject);
+
+alter table public.user_profiles enable row level security;
+
+revoke all privileges on table public.user_profiles from anon, authenticated, public;

@@ -356,6 +356,10 @@ def load_schema_sql() -> str:
 
     create index if not exists idx_user_profiles_user
         on public.user_profiles (issuer, subject);
+
+    alter table public.user_profiles enable row level security;
+
+    revoke all privileges on table public.user_profiles from anon, authenticated, public;
     """
 
 
@@ -369,15 +373,13 @@ def ensure_database_schema(db_url: str):
     try:
         with psycopg.connect(db_url, autocommit=True) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("select to_regclass('public.user_profiles') is not null")
-                table_exists = cursor.fetchone()[0]
-                if table_exists:
-                    return
+                # Always run the idempotent schema SQL so existing tables also
+                # receive security updates such as RLS changes.
                 cursor.execute(load_schema_sql())
     except Exception as exc:
         raise RuntimeError(
             "Could not initialize the Supabase profile table. "
-            "Check SUPABASE_DB_URL and run the setup SQL if your DB user cannot create tables."
+            "Check SUPABASE_DB_URL and run the setup SQL if your DB user cannot create or alter tables."
         ) from exc
 
 
